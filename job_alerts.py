@@ -1,22 +1,17 @@
-import feedparser
 import requests
 import time
 import os
-import sys
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 BASE_URL  = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-RSS_FEEDS = [
-    ("Upwork - Web App",        "https://www.upwork.com/ab/feed/jobs/rss?q=web+application&sort=recency&paging=0;10"),
-    ("Upwork - Mobile App",     "https://www.upwork.com/ab/feed/jobs/rss?q=mobile+application&sort=recency&paging=0;10"),
-    ("Upwork - React",          "https://www.upwork.com/ab/feed/jobs/rss?q=react+web+app&sort=recency&paging=0;10"),
-    ("Upwork - Flutter",        "https://www.upwork.com/ab/feed/jobs/rss?q=flutter+mobile+app&sort=recency&paging=0;10"),
-    ("Upwork - Android",        "https://www.upwork.com/ab/feed/jobs/rss?q=android+app+development&sort=recency&paging=0;10"),
-    ("Freelancer - Web App",    "https://www.freelancer.com/rss/projects.xml?keyword=web+application"),
-    ("Freelancer - Mobile App", "https://www.freelancer.com/rss/projects.xml?keyword=mobile+application"),
+# Keywords to match (case-insensitive)
+KEYWORDS = [
+    "web application", "web app", "mobile app", "mobile application",
+    "react", "flutter", "android", "ios", "react native",
+    "frontend", "full stack", "fullstack"
 ]
 
 seen_jobs = set()
@@ -33,26 +28,26 @@ class _Handler(BaseHTTPRequestHandler):
 
 def _run_http_server():
     port = int(os.environ.get("PORT", 10000))
-    print(f"Health-check server listening on port {port}", flush=True)
+    print(f"[HTTP] Health-check server on port {port}", flush=True)
     HTTPServer(("0.0.0.0", port), _Handler).serve_forever()
 
 threading.Thread(target=_run_http_server, daemon=True).start()
 # ────────────────────────────────────────────────────────────────────────────
 
 def send_message(chat_id, text):
-    """Send a plain-text Telegram message."""
     try:
-        requests.post(
+        r = requests.post(
             f"{BASE_URL}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+            json={"chat_id": chat_id, "text": text},
             timeout=10
         )
+        if not r.ok:
+            print(f"[Telegram error] {r.status_code} {r.text}", flush=True)
     except Exception as e:
         print(f"[send_message error] {e}", flush=True)
 
 def get_chat_id():
-    """Poll getUpdates until a user sends any message, then return their chat_id."""
-    print("Waiting for user to send /start to @FreelanceJobAlerts_bot ...", flush=True)
+    print("[Bot] Waiting for /start from user...", flush=True)
     offset = 0
     while True:
         try:
@@ -61,57 +56,113 @@ def get_chat_id():
                 params={"offset": offset, "timeout": 10},
                 timeout=15
             )
-            updates = r.json().get("result", [])
-            for update in updates:
+            for update in r.json().get("result", []):
                 offset = update["update_id"] + 1
-                msg = update.get("message", {})
+                msg     = update.get("message", {})
                 chat_id = msg.get("chat", {}).get("id")
-                text = msg.get("text", "")
                 if chat_id:
-                    print(f"Chat ID found: {chat_id}  (message: {text!r})", flush=True)
-                    # Send welcome acknowledgement
+                    print(f"[Bot] Chat ID: {chat_id}", flush=True)
                     send_message(chat_id,
-                        "Hello! I am your *FreelanceJobAlertsBot*\n\n"
-                        "I will notify you the moment new *web* or *mobile app* jobs appear on Upwork and Freelancer.\n\n"
-                        "Monitoring has started — sit back and I will alert you every 5 minutes!"
+                        "Hello! I am your Freelance Job Alerts Bot.\n\n"
+                        "I will send you new web & mobile app jobs from RemoteOK and Remotive every 5 minutes.\n\n"
+                        "Monitoring has started!"
                     )
                     return chat_id
         except Exception as e:
             print(f"[getUpdates error] {e}", flush=True)
         time.sleep(2)
 
-def send_alert(chat_id, source, title, link):
-    msg = (
-        f"New Job Alert!\n\n"
-        f"Source: {source}\n"
-        f"Title: {title}\n"
-        f"Link: {link}"
-    )
-    send_message(chat_id, msg)
+def matches_keywords(text):
+    t = text.lower()
+    return any(kw in t for kw in KEYWORDS)
+
+def fetch_remoteok(chat_id):
+    """RemoteOK public API - no key needed, returns real remote jobs"""
+    count = 0
+    try:
+        headers = {"User-Agent": "FreelanceJobAlertsBot/1.0"}
+        r = requests.get("https://remoteok.com/api", headers=headers, timeout=15)
+        jobs = r.json()
+        print(f"[RemoteOK] Got {len(jobs)} items", flush=True)
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            job_id = str(job.get("id", ""))
+            if not job_id or job_id in seen_jobs:
+                continue
+            title = job.get("position", "") or ""
+            tags  = " ".join(job.get("tags", []))
+            desc  = job.get("description", "") or ""
+            text  = f"{title} {tags} {desc}"
+            if matches_keywords(text):
+                seen_jobs.add(job_id)
+                company = job.get("company", "Unknown")
+                url     = job.get("url", "https://remoteok.com")
+                msg = (
+                    f"New Remote Job!\n\n"
+                    f"Source: RemoteOK\n"
+                    f"Title: {title}\n"
+                    f"Company: {company}\n"
+                    f"Link: {url}"
+                )
+                send_message(chat_id, msg)
+                count += 1
+    except Exception as e:
+        print(f"[RemoteOK error] {e}", flush=True)
+    return count
+
+def fetch_remotive(chat_id):
+    """Remotive public API - no key needed, categorized remote jobs"""
+    count = 0
+    search_terms = ["web", "mobile", "react", "flutter", "android"]
+    for term in search_terms:
+        try:
+            r = requests.get(
+                f"https://remotive.com/api/remote-jobs",
+                params={"search": term, "limit": 20},
+                timeout=15
+            )
+            jobs = r.json().get("jobs", [])
+            print(f"[Remotive] '{term}' -> {len(jobs)} jobs", flush=True)
+            for job in jobs:
+                job_id = str(job.get("id", ""))
+                if not job_id or job_id in seen_jobs:
+                    continue
+                title = job.get("title", "") or ""
+                desc  = job.get("description", "") or ""
+                text  = f"{title} {desc}"
+                if matches_keywords(text):
+                    seen_jobs.add(job_id)
+                    company = job.get("company_name", "Unknown")
+                    url     = job.get("url", "https://remotive.com")
+                    msg = (
+                        f"New Remote Job!\n\n"
+                        f"Source: Remotive\n"
+                        f"Title: {title}\n"
+                        f"Company: {company}\n"
+                        f"Link: {url}"
+                    )
+                    send_message(chat_id, msg)
+                    count += 1
+        except Exception as e:
+            print(f"[Remotive error] term={term}: {e}", flush=True)
+        time.sleep(1)
+    return count
 
 def check_feeds(chat_id):
-    new_count = 0
-    for source, url in RSS_FEEDS:
-        try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries:
-                job_id = entry.get("id") or entry.get("link")
-                if job_id and job_id not in seen_jobs:
-                    seen_jobs.add(job_id)
-                    send_alert(chat_id, source, entry.get("title", "No title"), entry.get("link", ""))
-                    new_count += 1
-        except Exception as e:
-            print(f"[feed error] {source}: {e}", flush=True)
-    print(f"Feed check done — {new_count} new jobs sent.", flush=True)
+    print("[Bot] Checking feeds...", flush=True)
+    total = 0
+    total += fetch_remoteok(chat_id)
+    total += fetch_remotive(chat_id)
+    print(f"[Bot] Done — {total} new jobs sent. Total seen: {len(seen_jobs)}", flush=True)
 
 def main():
     global CHAT_ID
     CHAT_ID = get_chat_id()
-    print("Bot running! Checking feeds every 5 minutes.", flush=True)
-    # First immediate check
-    check_feeds(CHAT_ID)
+    print("[Bot] Running! Checking every 5 minutes.", flush=True)
+    check_feeds(CHAT_ID)   # immediate first check
     while True:
-        time.sleep(300)  # 5 minutes
+        time.sleep(300)
         check_feeds(CHAT_ID)
 
 if __name__ == "__main__":
