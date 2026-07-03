@@ -1,8 +1,9 @@
 import feedparser
 import requests
 import time
+import os
 
-BOT_TOKEN = "8802301298:AAGkFqr0AbdKDNt3ShrsgbDSWCPK2MdsMTk"
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 RSS_FEEDS = [
     ("Upwork - Web App",        "https://www.upwork.com/ab/feed/jobs/rss?q=web+application&sort=recency&paging=0;10"),
